@@ -1,0 +1,14 @@
+# RunPod serverless
+runpod
+
+# Image / PDF processing
+pillow
+pdf2image
+numpy<2.0
+
+# HTTP client for vLLM API
+requests
+
+# HF hub for model download at build time
+huggingface_hub
+protobuf
