@@ -12,6 +12,7 @@ from PIL import Image
 import PIL
 PIL.Image.MAX_IMAGE_PIXELS = None  # disable decompression bomb guard for large PDFs
 from pdf2image import convert_from_bytes
+from html import escape
 
 # ===============================
 # CONFIG
@@ -60,6 +61,177 @@ def clean_unlimited_ocr_output(raw_text: str) -> str:
     text = re.sub(r'[ \t]+$', '', text, flags=re.MULTILINE)
 
     return text.strip()
+
+# ===============================
+# HTML CONVERSION
+# ===============================
+def convert_ocr_to_html(text: str, preserve_layout: bool = False) -> str:
+    """
+    Convert OCR tagged output into clean HTML.
+    
+    Input format:
+        title [x1, y1, x2, y2]Content
+        text  [x1, y1, x2, y2]Content
+        table [x1, y1, x2, y2]<table>...</table>
+        image [x1, y1, x2, y2]
+    
+    Args:
+        text: Raw OCR text with bounding box annotations.
+        preserve_layout: If True, uses absolute CSS positioning to recreate
+                         the original document layout. If False, outputs a
+                         clean reading-order HTML flow.
+    
+    Returns:
+        HTML string wrapped in <div class="ocr-page">.
+    """
+    if not text or text.strip() in ("[Empty or unreadable page]", ""):
+        return '<div class="ocr-page empty">[Empty or unreadable page]</div>'
+
+    lines = text.strip().split('\n')
+    elements = []
+    max_x, max_y = 0, 0
+
+    # Pattern: tag [x1, y1, x2, y2]content
+    line_re = re.compile(
+        r'^(title|text|table|image)\s+\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\](.*)$'
+    )
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        m = line_re.match(line)
+        if not m:
+            # Fallback: plain text line that didn't match pattern
+            elements.append(f'<p class="ocr-text">{escape(line)}</p>')
+            continue
+
+        tag_type, x1, y1, x2, y2, content = m.groups()
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+        max_x = max(max_x, x2)
+        max_y = max(max_y, y2)
+
+        # Build style for absolute positioning
+        bbox_attr = f'[{x1},{y1},{x2},{y2}]'
+        if preserve_layout:
+            base_style = f'position:absolute;left:{x1}px;top:{y1}px;width:{x2 - x1}px;'
+        else:
+            base_style = ''
+
+        if tag_type == 'title':
+            inner = escape(content)
+            if preserve_layout:
+                style = base_style + f'height:{y2 - y1}px;margin:0;'
+                el = f'<h2 class="ocr-title" style="{style}" data-bbox="{bbox_attr}">{inner}</h2>'
+            else:
+                el = f'<h2 class="ocr-title" data-bbox="{bbox_attr}">{inner}</h2>'
+
+        elif tag_type == 'text':
+            inner = escape(content)
+            if preserve_layout:
+                style = base_style + f'height:{y2 - y1}px;margin:0;'
+                el = f'<p class="ocr-text" style="{style}" data-bbox="{bbox_attr}">{inner}</p>'
+            else:
+                el = f'<p class="ocr-text" data-bbox="{bbox_attr}">{inner}</p>'
+
+        elif tag_type == 'table':
+            # The model wraps table text in <table>...</table> but usually
+            # without proper <tr><td>. We extract the inner text and build a
+            # simple table structure. You can customize this parsing logic.
+            table_match = re.search(r'<table>(.*?)</table>', content, re.DOTALL)
+            if table_match:
+                raw = table_match.group(1).strip()
+            else:
+                raw = content.strip()
+
+            # Heuristic: split by newlines for rows, then by colon for key-value
+            rows_html = ""
+            # First try to split by obvious line breaks or commas
+            row_candidates = [r.strip() for r in re.split(r'[\n,](?=\w+[:])', raw) if r.strip()]
+            if len(row_candidates) <= 1:
+                # If no key-value pattern found, just split by newlines
+                row_candidates = [r.strip() for r in raw.split('\n') if r.strip()]
+            if len(row_candidates) <= 1:
+                # Last resort: split by commas
+                row_candidates = [r.strip() for r in raw.split(',') if r.strip()]
+
+            for row in row_candidates:
+                if ':' in row and row.count(':') == 1 and len(row) < 200:
+                    key, val = row.split(':', 1)
+                    rows_html += f'<tr><td class="ocr-td-key"><strong>{escape(key.strip())}</strong></td><td class="ocr-td-val">{escape(val.strip())}</td></tr>'
+                else:
+                    rows_html += f'<tr><td colspan="2">{escape(row)}</td></tr>'
+
+            if not rows_html:
+                rows_html = f'<tr><td>{escape(raw)}</td></tr>'
+
+            inner = f'<table class="ocr-table">{rows_html}</table>'
+
+            if preserve_layout:
+                style = base_style
+                el = f'<div class="ocr-table-wrapper" style="{style}" data-bbox="{bbox_attr}">{inner}</div>'
+            else:
+                el = f'<div class="ocr-table-wrapper" data-bbox="{bbox_attr}">{inner}</div>'
+
+        elif tag_type == 'image':
+            if preserve_layout:
+                style = base_style + f'height:{y2 - y1}px;background:#f0f0f0;border:1px dashed #999;display:flex;align-items:center;justify-content:center;'
+                el = f'<div class="ocr-image" style="{style}" data-bbox="{bbox_attr}">[Image]</div>'
+            else:
+                el = f'<div class="ocr-image" data-bbox="{bbox_attr}">[Image]</div>'
+
+        elements.append(el)
+
+    # Wrap page
+    if preserve_layout and max_x > 0 and max_y > 0:
+        container_style = (
+            f'position:relative;width:{max_x}px;height:{max_y}px;'
+            f'border:1px solid #ddd;background:#fff;margin-bottom:20px;'
+        )
+        html = f'<div class="ocr-page" style="{container_style}">\n' + '\n'.join(elements) + '\n</div>'
+    else:
+        html = '<div class="ocr-page">\n' + '\n'.join(elements) + '\n</div>'
+
+    return html
+
+
+def build_full_html(pages_html: list, title: str = "OCR Document") -> str:
+    """
+    Wrap per-page HTML fragments into a complete HTML document with basic CSS.
+    """
+    pages_joined = '\n'.join(
+        f'<div class="page-container" data-page="{i+1}">{html}</div>'
+        for i, html in enumerate(pages_html)
+    )
+
+    css = """
+    <style>
+        body { font-family: Georgia, serif; line-height: 1.6; max-width: 900px; margin: 40px auto; padding: 20px; color: #333; background: #fafafa; }
+        .page-container { background: #fff; border: 1px solid #e0e0e0; padding: 40px; margin-bottom: 30px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .ocr-page { position: relative; }
+        .ocr-title { color: #1a1a1a; font-size: 1.4em; margin-top: 1.2em; margin-bottom: 0.4em; border-bottom: 1px solid #eee; padding-bottom: 0.2em; }
+        .ocr-text { margin: 0.6em 0; text-align: justify; }
+        .ocr-table-wrapper { margin: 1em 0; overflow-x: auto; }
+        .ocr-table { border-collapse: collapse; width: 100%; font-size: 0.95em; }
+        .ocr-table td { border: 1px solid #ccc; padding: 6px 10px; vertical-align: top; }
+        .ocr-td-key { white-space: nowrap; background: #f7f7f7; width: 30%; }
+        .ocr-image { color: #666; font-style: italic; font-size: 0.9em; margin: 0.5em 0; }
+        .empty { color: #999; font-style: italic; text-align: center; padding: 40px; }
+    </style>
+    """
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>{escape(title)}</title>
+    {css}
+</head>
+<body>
+{pages_joined}
+</body>
+</html>"""
 
 # ===============================
 # HALLUCINATION DETECTION
@@ -256,12 +428,19 @@ def ocr_batch(images: list) -> list:
 # ===============================
 def handler(event):
     try:
-        if "image" in event["input"]:
-            pages = [decode_image(event["input"]["image"])]
-        elif "file" in event["input"]:
-            pages = decode_pdf(event["input"]["file"])
+        input_data = event.get("input", {})
+        
+        if "image" in input_data:
+            pages = [decode_image(input_data["image"])]
+        elif "file" in input_data:
+            pages = decode_pdf(input_data["file"])
         else:
             return {"status": "error", "message": "Missing image or file"}
+
+        # Options
+        output_format = input_data.get("output_format", "json").lower()  # "json" or "html"
+        preserve_layout = input_data.get("preserve_layout", False)       # True = absolute CSS positioning
+        full_html = input_data.get("full_html", True)                    # True = wrap in <html><body>
 
         total_pages = len(pages)
         log(f"Processing {total_pages} pages via vLLM...")
@@ -270,6 +449,8 @@ def handler(event):
         batch_results = ocr_batch(pages)
 
         extracted_pages = []
+        pages_html = []
+
         for j, text in enumerate(batch_results):
             page_num = j + 1
 
@@ -281,14 +462,39 @@ def handler(event):
 
             extracted_pages.append({"page": page_num, "text": text})
 
+            # Generate HTML for this page
+            if output_format == "html":
+                page_html = convert_ocr_to_html(text, preserve_layout=preserve_layout)
+                pages_html.append(page_html)
+
         elapsed = time.time() - start_time
         log(f"Completed {total_pages} pages in {elapsed:.1f}s ({elapsed/total_pages:.1f}s/page)")
 
-        return {
-            "status": "success",
-            "total_pages": len(extracted_pages),
-            "pages": extracted_pages
-        }
+        # Build response
+        if output_format == "html":
+            if full_html:
+                html_output = build_full_html(pages_html, title="OCR Result")
+                return {
+                    "status": "success",
+                    "total_pages": len(extracted_pages),
+                    "format": "html",
+                    "html": html_output
+                }
+            else:
+                # Return per-page HTML fragments
+                return {
+                    "status": "success",
+                    "total_pages": len(extracted_pages),
+                    "format": "html",
+                    "pages": [{"page": i+1, "html": html} for i, html in enumerate(pages_html)]
+                }
+        else:
+            # Default JSON with raw text
+            return {
+                "status": "success",
+                "total_pages": len(extracted_pages),
+                "pages": extracted_pages
+            }
 
     except Exception as e:
         log(f"Error: {str(e)}")
